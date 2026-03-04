@@ -74,5 +74,3 @@ class TrajectoryDataset(Dataset):
             'pred_deltas_gt': pred_deltas_gt,
             'homography': torch.tensor(self.homography, dtype=torch.float32)
         }
-
-from torch.utils.data import DataLoader
