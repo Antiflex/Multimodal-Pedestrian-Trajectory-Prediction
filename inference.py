@@ -20,9 +20,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ══════════════════════════════════════════════════════
-#  CONSTANTES
+#  CONSTANTES  (identiques à TransformerInterraction.py)
 # ══════════════════════════════════════════════════════
-MODEL_NAME = "generator.pt"  # chemin du modèle entraîné
 SEQ_PAST     = 8
 SEQ_FUT      = 12
 NOISE_DIM    = 64
@@ -30,7 +29,7 @@ D_MODEL      = 128
 MAX_NEIGH    = 10
 NEIGH_RADIUS = 5.0
 
-N_GROUPS  = 5   # groupes de 20 frames a tirer aleatoirement
+N_GROUPS  = 10   # groupes de 20 frames a tirer aleatoirement
 N_SAMPLES = 20  # trajectoires generees par pieton (Best-of-N)
 SEED      = None  # None = aleatoire a chaque run | entier = reproductible (ex: 42)
 
@@ -156,6 +155,33 @@ class Generator(nn.Module):
         return self.prediction_head(h)
 
 
+class Critic(nn.Module):
+    """
+    Evalue le realisme d'une trajectoire complete (obs + future).
+    Retourne un score non borne : plus c'est eleve, plus c'est realiste.
+    Identique a TransformerInterraction.py.
+    """
+    def __init__(self):
+        super().__init__()
+        self.scene_projection    = nn.Linear(2048, D_MODEL)
+        self.trajectory_encoder  = Encoder(input_dim=2, nb_layers=3)
+        self.score_head = nn.Sequential(
+            nn.Linear(D_MODEL, 256),
+            nn.LeakyReLU(0.2),
+            nn.Linear(256, 128),
+            nn.LeakyReLU(0.2),
+            nn.Linear(128, 1)
+        )
+
+    def forward(self, traj_obs, traj_fut, scene_emb):
+        # Concatener obs + futur -> (B, 20, 2)
+        full_traj    = torch.cat([traj_obs, traj_fut], dim=1)
+        scene_token  = self.scene_projection(scene_emb).unsqueeze(1)
+        traj_encoded = self.trajectory_encoder(full_traj)
+        h = torch.cat([scene_token, traj_encoded], dim=1).mean(dim=1)
+        return self.score_head(h)   # (B, 1) score non borne
+
+
 # ══════════════════════════════════════════════════════
 #  FONCTIONS UTILITAIRES
 # ══════════════════════════════════════════════════════
@@ -172,6 +198,36 @@ def best_of_n(all_samples, y_true):
     ades     = np.linalg.norm(all_samples - y_true[None], axis=-1).mean(axis=2)
     best_idx = ades.argmin(axis=0)
     return all_samples[best_idx, np.arange(len(y_true))]
+
+@torch.no_grad()
+def critic_best_of_n(C, samples_n, X_n, EMB, batch_size=256):
+    """
+    Pour chaque pieton, choisit parmi N_SAMPLES trajectoires normalisees
+    celle que le Critic juge la plus realiste (score le plus eleve).
+
+    samples_n : (N_SAMPLES, n_ped, SEQ_FUT, 2)  normalise
+    X_n       : (n_ped, SEQ_PAST, 2)             normalise
+    EMB       : (n_ped, 2048)
+    Retourne  : (n_ped, SEQ_FUT, 2)  normalise
+    """
+    C.eval()
+    N_S, n_ped, T, _ = samples_n.shape
+    all_scores = np.zeros((N_S, n_ped), dtype=np.float32)
+
+    for s in range(N_S):
+        for start in range(0, n_ped, batch_size):
+            xb  = torch.tensor(X_n[start:start+batch_size],
+                               dtype=torch.float32).to(device)
+            yb  = torch.tensor(samples_n[s, start:start+batch_size],
+                               dtype=torch.float32).to(device)
+            eb  = torch.tensor(EMB[start:start+batch_size],
+                               dtype=torch.float32).to(device)
+            scores = C(xb, yb, eb).squeeze(-1).cpu().numpy()  # (B,)
+            all_scores[s, start:start+batch_size] = scores
+
+    # Pour chaque pieton, prendre le sample avec le score max
+    best_idx = all_scores.argmax(axis=0)       # (n_ped,)
+    return samples_n[best_idx, np.arange(n_ped)]  # (n_ped, SEQ_FUT, 2)
 
 @torch.no_grad()
 def rollout(G, traj, neighbors, mask, scene_emb, z):
@@ -240,14 +296,23 @@ def get_scene_embedding(frame_id: int, scene_dir: str) -> np.ndarray:
 # ══════════════════════════════════════════════════════
 #  CHARGEMENT DU GÉNÉRATEUR ET DES NORMALISEURS
 # ══════════════════════════════════════════════════════
-print("\n=== Chargement du modèle ===")
+print("\n=== Chargement des modeles ===")
+
+# Generateur
 G = Generator().to(device)
-G.load_state_dict(torch.load(MODEL_NAME, map_location=device))
+G.load_state_dict(torch.load("generator.pt", map_location=device))
 G.eval()
+print("  Generateur charge : generator.pt")
+
+# Critic (discriminateur WGAN)
+C = Critic().to(device)
+C.load_state_dict(torch.load("critic.pt", map_location=device))
+C.eval()
+print("  Critic charge     : critic.pt")
 
 mean_norm = np.load("normalizer_mean.npy")
 std_norm  = np.load("normalizer_std.npy")
-print(f"mean={mean_norm}  std={std_norm}")
+print(f"  mean={mean_norm}  std={std_norm}")
 
 
 # ══════════════════════════════════════════════════════
@@ -425,37 +490,50 @@ for g_i, group in enumerate(groups):
     X_n = normalize(gdata["X"], mean_norm, std_norm)
     N_n = normalize(gdata["N"], mean_norm, std_norm)
 
-    # Génération — (N_SAMPLES, n_ped, SEQ_FUT, 2)
+    # Generation — (N_SAMPLES, n_ped, SEQ_FUT, 2) normalise
     samples_n    = generate_predictions(G, X_n, N_n, gdata["M"], gdata["EMB"],
                                         n_samples=N_SAMPLES)
-    samples_real = samples_n * std_norm + mean_norm   # dénormaliser
+    samples_real = samples_n * std_norm + mean_norm   # denormaliser
 
+    # ── Trois strategies de selection ──────────────────────────────
+    # 1) Best-of-N  : utilise le ground truth (oracle, evaluation seult)
     Y_pred_bon  = best_of_n(samples_real, gdata["Y"])   # (n_ped, 12, 2)
+
+    # 2) Mean-of-N  : moyenne de toutes les trajectoires
     Y_pred_mean = samples_real.mean(axis=0)              # (n_ped, 12, 2)
+
+    # 3) Critic-best : le Critic choisit la trajectoire la plus realiste
+    #    -> pas besoin du ground truth, utilisable en production !
+    crit_best_n = critic_best_of_n(C, samples_n, X_n, gdata["EMB"])
+    Y_pred_crit = crit_best_n * std_norm + mean_norm     # (n_ped, 12, 2)
 
     ade_bon,  fde_bon  = compute_ade_fde(gdata["Y"], Y_pred_bon)
     ade_mean, fde_mean = compute_ade_fde(gdata["Y"], Y_pred_mean)
+    ade_crit, fde_crit = compute_ade_fde(gdata["Y"], Y_pred_crit)
 
-    print(f"  Best-of-{N_SAMPLES} → ADE={ade_bon:.4f} m   FDE={fde_bon:.4f} m")
-    print(f"  Mean-of-{N_SAMPLES} → ADE={ade_mean:.4f} m   FDE={fde_mean:.4f} m\n")
+    print(f"  Best-of-{N_SAMPLES} (oracle)  → ADE={ade_bon:.4f} m  FDE={fde_bon:.4f} m")
+    print(f"  Critic-best (realiste)       → ADE={ade_crit:.4f} m  FDE={fde_crit:.4f} m")
+    print(f"  Mean-of-{N_SAMPLES}           → ADE={ade_mean:.4f} m  FDE={fde_mean:.4f} m\n")
 
     group_results.append({
         "g_idx":              g_i + 1,
         "scene_name":         group["scene_name"],
         "scene_dir":          group["scene_dir"],
-        "annot_frames_all":   group.get("annot_frames_all"),  # pour mapping image
-        "fname":         group["fname"],
-        "obs_frames":    gdata["obs_frames"],
-        "fut_frames":    gdata["fut_frames"],
-        "n_ped":         n_ped,
-        "X":             gdata["X"],
-        "Y":             gdata["Y"],
-        "Y_pred_bon":    Y_pred_bon,
-        "Y_pred_mean":   Y_pred_mean,
-        "samples_real":  samples_real,
-        "ade_bon":       ade_bon,  "fde_bon":      fde_bon,
-        "ade_mean":      ade_mean, "fde_mean":     fde_mean,
-        "pids":          gdata["pids"],
+        "annot_frames_all":   group.get("annot_frames_all"),
+        "fname":              group["fname"],
+        "obs_frames":         gdata["obs_frames"],
+        "fut_frames":         gdata["fut_frames"],
+        "n_ped":              n_ped,
+        "X":                  gdata["X"],
+        "Y":                  gdata["Y"],
+        "Y_pred_bon":         Y_pred_bon,
+        "Y_pred_crit":        Y_pred_crit,
+        "Y_pred_mean":        Y_pred_mean,
+        "samples_real":       samples_real,
+        "ade_bon":   ade_bon,  "fde_bon":   fde_bon,
+        "ade_crit":  ade_crit, "fde_crit":  fde_crit,
+        "ade_mean":  ade_mean, "fde_mean":  fde_mean,
+        "pids":               gdata["pids"],
     })
 
 
@@ -644,14 +722,27 @@ for col_i, res in enumerate(group_results):
                            color=color, s=90, marker="x",
                            linewidths=2.5, zorder=5)                  # fin obs
 
-            # Prediction — pointilles
+            # Prediction Best-of-N (oracle) — pointilles
             link = np.array([obs_px[-1], pred_px[0]])
             ax_top.plot(link[:, 0], link[:, 1],
                         "--", color=color, lw=1.5, alpha=0.5, zorder=4)
             ax_top.plot(pred_px[:, 0], pred_px[:, 1],
                         "--", color=color, lw=2.5, zorder=4)
             ax_top.scatter(pred_px[-1, 0], pred_px[-1, 1],
-                           color=color, s=90, marker="^", zorder=5)   # fin predit
+                           color=color, s=90, marker="^", zorder=5)
+
+            # Prediction Critic-best (realiste) — tirets+points
+            crit_raw   = res["Y_pred_crit"][p_i]
+            crit_px    = world_to_pixel(crit_raw, H_inv)
+            if not in_img(crit_px).any():
+                crit_px = world_to_pixel(crit_raw[:, ::-1], H_inv)
+            link_c = np.array([obs_px[-1], crit_px[0]])
+            ax_top.plot(link_c[:, 0], link_c[:, 1],
+                        "-.", color=color, lw=1.2, alpha=0.5, zorder=4)
+            ax_top.plot(crit_px[:, 0], crit_px[:, 1],
+                        "-.", color=color, lw=2.5, zorder=4)
+            ax_top.scatter(crit_px[-1, 0], crit_px[-1, 1],
+                           color=color, s=90, marker="D", zorder=5)
         else:
             # Pas d'homographie : coordonnees monde brutes
             ax_top.plot(full_gt[:, 0], full_gt[:, 1],
@@ -661,14 +752,17 @@ for col_i, res in enumerate(group_results):
 
     # Légende compacte
     legend_handles = [
-        Line2D([0], [0], color="w", lw=2,  ls="-",  label="Réel (obs+futur)"),
-        Line2D([0], [0], color="w", lw=2,  ls="--", label=f"Prédit Best-of-{N_SAMPLES}"),
-        Line2D([0], [0], color="w", lw=0,  marker="o", ms=5,
-               markerfacecolor="w", label="Début"),
-        Line2D([0], [0], color="w", lw=0,  marker="x", ms=6,
+        Line2D([0], [0], color="w", lw=2,  ls="-",   label="Reel (obs+futur)"),
+        Line2D([0], [0], color="w", lw=2,  ls="--",  label=f"Best-of-{N_SAMPLES} (oracle)"),
+        Line2D([0], [0], color="w", lw=2,  ls="-.",  label="Critic-best (realiste)"),
+        Line2D([0], [0], color="w", lw=0,  marker="o",  ms=5,
+               markerfacecolor="w", label="Debut"),
+        Line2D([0], [0], color="w", lw=0,  marker="x",  ms=6,
                markerfacecolor="w", label="Fin obs."),
-        Line2D([0], [0], color="w", lw=0,  marker="^", ms=6,
-               markerfacecolor="w", label="Fin prédit"),
+        Line2D([0], [0], color="w", lw=0,  marker="^",  ms=6,
+               markerfacecolor="w", label="Fin Best-of-N"),
+        Line2D([0], [0], color="w", lw=0,  marker="D",  ms=5,
+               markerfacecolor="w", label="Fin Critic"),
     ]
     ax_top.legend(handles=legend_handles, fontsize=6.5,
                   loc="lower right", framealpha=0.65,
@@ -813,20 +907,25 @@ plt.show()
 # ══════════════════════════════════════════════════════
 #  RÉSUMÉ CONSOLE
 # ══════════════════════════════════════════════════════
-print("\n" + "="*70)
-print("                      RÉSUMÉ FINAL")
-print("="*70)
-print(f"{'Gr.':<4} {'Scène':<13} {'Frames':<14} {'Pied.':<6}"
-      f"{'ADE Best':>9} {'FDE Best':>9} {'ADE Mean':>9} {'FDE Mean':>9}")
-print("-"*70)
+print("\n" + "="*82)
+print("                         RESUME FINAL")
+print("="*82)
+print(f"{'Gr.':<4} {'Scene':<13} {'Frames':<14} {'Ped.':<6}"
+      f"{'ADE Best':>9} {'ADE Crit':>9} {'ADE Mean':>9}"
+      f"{'FDE Best':>8} {'FDE Crit':>9}")
+print("-"*82)
 for r in group_results:
-    fr = f"{r['obs_frames'][0]}–{r['fut_frames'][-1]}"
+    fr = f"{r['obs_frames'][0]}-{r['fut_frames'][-1]}"
     print(f"{r['g_idx']:<4} {r['scene_name']:<13} {fr:<14} {r['n_ped']:<6}"
-          f"{r['ade_bon']:>9.4f} {r['fde_bon']:>9.4f}"
-          f"{r['ade_mean']:>9.4f} {r['fde_mean']:>9.4f}")
+          f"{r['ade_bon']:>9.4f} {r['ade_crit']:>9.4f} {r['ade_mean']:>9.4f}"
+          f"{r['fde_bon']:>8.4f} {r['fde_crit']:>9.4f}")
 if group_results:
-    print("-"*70)
+    print("-"*82)
     print(f"{'Moy.':<4} {'':<13} {'':<14} {'':<6}"
-          f"{np.mean(ade_bons):>9.4f} {np.mean(fde_bons):>9.4f}"
-          f"{np.mean(ade_means):>9.4f} {np.mean(fde_means):>9.4f}")
-print("="*70)
+          f"{np.mean(ade_bons):>9.4f} {np.mean(ade_crit):>9.4f} {np.mean(ade_means):>9.4f}"
+          f"{np.mean(fde_bons):>8.4f} {np.mean(fde_crit):>9.4f}")
+print("="*82)
+print("\nLegende :")
+print("  ADE Best  = Best-of-N utilisant le ground truth (oracle, borne inferieure)")
+print("  ADE Crit  = Critic choisit la meilleure trajectoire (sans ground truth)")
+print("  ADE Mean  = Moyenne de toutes les trajectoires generees")
