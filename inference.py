@@ -20,8 +20,9 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ══════════════════════════════════════════════════════
-#  CONSTANTES  (identiques à TransformerInterraction.py)
+#  CONSTANTES
 # ══════════════════════════════════════════════════════
+MODEL_NAME = "generator.pt"  # chemin du modèle entraîné
 SEQ_PAST     = 8
 SEQ_FUT      = 12
 NOISE_DIM    = 64
@@ -241,7 +242,7 @@ def get_scene_embedding(frame_id: int, scene_dir: str) -> np.ndarray:
 # ══════════════════════════════════════════════════════
 print("\n=== Chargement du modèle ===")
 G = Generator().to(device)
-G.load_state_dict(torch.load("generator.pt", map_location=device))
+G.load_state_dict(torch.load(MODEL_NAME, map_location=device))
 G.eval()
 
 mean_norm = np.load("normalizer_mean.npy")
