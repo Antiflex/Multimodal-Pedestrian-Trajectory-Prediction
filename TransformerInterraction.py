@@ -673,6 +673,8 @@ print(f"\n[Best-of-20]  ADE = {ade_best:.4f}  FDE = {fde_best:.4f}")
 print(f"[Mean-of-20]  ADE = {ade_mean:.4f}  FDE = {fde_mean:.4f}")
 
 torch.save(G.state_dict(), "generator.pt")
+np.save("normalizer_mean.npy", mean)
+np.save("normalizer_std.npy", std)
 torch.save(C.state_dict(), "critic.pt")
 print("Modèles sauvegardés.")
 
