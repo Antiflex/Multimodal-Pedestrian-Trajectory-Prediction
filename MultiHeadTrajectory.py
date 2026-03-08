@@ -1,3 +1,7 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
 import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
@@ -254,11 +258,12 @@ def get_trajectory_model(seq_past, seq_future):
 
 
 
-
-
-
-train_raw = load_txt(r"C:\Users\xordp\Desktop\EFREI\IA\ING3\TP_Attention\data_trajpred-20260304T083725Z-3-001\data_trajpred\raw\train\students001_train.txt")
-val_raw = load_txt(r"C:\Users\xordp\Desktop\EFREI\IA\ING3\TP_Attention\data_trajpred-20260304T083725Z-3-001\data_trajpred\raw\val\students001_val.txt")
+dataset_base = os.getenv("DATASET_BASE")
+trainning_set = "raw/train/students001_train.txt"
+val_set = "raw/val/students001_val.txt"
+print("Dataset base path:", dataset_base)
+train_raw = load_txt(os.path.join(dataset_base, trainning_set))
+val_raw = load_txt(os.path.join(dataset_base, val_set))
 
 
 # 2) Fenêtres 8->12

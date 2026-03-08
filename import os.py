@@ -1,6 +1,8 @@
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
-nvidia_base = r"C:\Users\xordp\miniconda3\envs\tf_gpu\Lib\site-packages\nvidia"
+nvidia_base = os.getenv("NVIDIA_BASE")
 pkgs = [
     "cublas\\bin",
     "cuda_nvrtc\\bin", 

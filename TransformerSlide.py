@@ -1,3 +1,7 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
 import tensorflow as tf
 import numpy as np
 import matplotlib.pyplot as plt
@@ -6,14 +10,13 @@ import torch.nn as nn
 import torchvision.models as torchvision_models
 import torchvision.transforms as T
 from PIL import Image
-import os
 
 from collections import defaultdict
 
 SEQ_PAST = 8
 SEQ_FUT  = 12
 
-BASE_DIR      = r"C:\Users\xordp\Desktop\EFREI\IA\ING3\TP_Attention\data_trajpred-20260304T083725Z-3-001\data_trajpred"
+BASE_DIR      = os.getenv("DATASET_BASE")
 RAW_TRAIN_DIR = os.path.join(BASE_DIR, "raw", "train")
 RAW_VAL_DIR   = os.path.join(BASE_DIR, "raw", "val")
 
